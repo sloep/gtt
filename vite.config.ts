@@ -14,8 +14,9 @@ export default defineConfig({
 			adapter: adapter({
 				pages: 'build',
 				assets: 'build',
-				fallback: 'index.html',
-				strict: true
+				fallback: undefined,
+				strict: true,
+				precompress: false
 			})
 		})
 	]
