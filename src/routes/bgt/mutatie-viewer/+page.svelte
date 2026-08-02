@@ -70,6 +70,7 @@
 	let wasLayer: any;
 	let wordtLayer: any;
 	let leafletCache = new Map<string, any>();
+	const arcCache = new Map<string, any>(); // Cache voor boogsegmenten om dubbele berekeningen te voorkomen
 	let seenSignatures = new Set<string>(); // Voor detectie van exacte duplicaten
 	let dragCounter = 0;
 
@@ -281,36 +282,222 @@
 		const styling = { ...STYLES[styleKey], originalWeight: STYLES[styleKey].weight };
 		const createdLayers: any[] = [];
 
-		Array.from(node.getElementsByTagName('*'))
-			.filter((n: Element) => n.localName === 'posList' || n.localName === 'pos')
-			.forEach((posNode: Element) => {
-				const coords = (posNode.textContent || '').trim().split(/\s+/).map(Number);
-				const latLngs: any[] = [];
-				for (let i = 0; i < coords.length; i += 2)
-					if (!isNaN(coords[i]) && !isNaN(coords[i + 1]))
-						latLngs.push(rdToWgs84(coords[i], coords[i + 1]));
+		// 3-punts boog om te zetten naar een reeks van punten, waarom ondersteund leaflet dit niet? zucht..
+		const getArcPoints = (x1: number, y1: number, x2: number, y2: number, x3: number, y3: number, segments = 12) => {
+			const isForward = (x1 < x3) || (x1 === x3 && y1 < y3);
+			const cacheKey = isForward 
+				? `${x1.toFixed(3)},${y1.toFixed(3)}|${x2.toFixed(3)},${y2.toFixed(3)}|${x3.toFixed(3)},${y3.toFixed(3)}`
+				: `${x3.toFixed(3)},${y3.toFixed(3)}|${x2.toFixed(3)},${y2.toFixed(3)}|${x1.toFixed(3)},${y1.toFixed(3)}`;
 
-				let layer: any = null;
-				if (latLngs.length === 1)
-					layer = L.circleMarker(latLngs[0], {
-						radius: 6,
-						...styling,
-						fillOpacity: styleKey === 'was_contour' ? 0 : 0.8
-					});
-				else if (latLngs.length > 1) {
-					const isClosed =
-						Math.abs(latLngs[0][0] - latLngs[latLngs.length - 1][0]) < 0.0001 &&
-						Math.abs(latLngs[0][1] - latLngs[latLngs.length - 1][1]) < 0.0001;
-					layer =
-						isClosed && latLngs.length > 3
-							? L.polygon(latLngs, styling)
-							: L.polyline(latLngs, styling);
+			// Retourneer direct vanuit de cache om topologische kieren en dubbele berekeningen te voorkomen
+			if (arcCache.has(cacheKey)) {
+				const cachedPts = arcCache.get(cacheKey)!;
+				if (isForward) return cachedPts;
+				
+				const reversed = [];
+				for (let i = cachedPts.length - 1; i >= 0; i--) {
+					reversed.push(cachedPts[i]);
 				}
-				if (layer) {
+				return reversed;
+			}
+
+			// Bereken de determinant om te checken of de 3 punten op een kaarsrechte lijn liggen
+			const D = 2 * (x1 * (y2 - y3) + x2 * (y3 - y1) + x3 * (y1 - y2));
+			if (Math.abs(D) < 0.001) return [[x1, y1], [x2, y2], [x3, y3]]; 
+
+			// Bereken het wiskundige middelpunt (cx, cy) en de straal (r) van de cirkel die door de punten loopt
+			const cx = ((x1 * x1 + y1 * y1) * (y2 - y3) + (x2 * x2 + y2 * y2) * (y3 - y1) + (x3 * x3 + y3 * y3) * (y1 - y2)) / D;
+			const cy = ((x1 * x1 + y1 * y1) * (x3 - x2) + (x2 * x2 + y2 * y2) * (x1 - x3) + (x3 * x3 + y3 * y3) * (x2 - x1)) / D;
+			const r = Math.sqrt((x1 - cx) ** 2 + (y1 - cy) ** 2);
+
+			const startX = isForward ? x1 : x3;
+			const startY = isForward ? y1 : y3;
+			const endX = isForward ? x3 : x1;
+			const endY = isForward ? y3 : y1;
+
+			// Bepaal de hoeken van het start- en eindpunt ten opzichte van het zojuist berekende middelpunt
+			let a1 = Math.atan2(startY - cy, startX - cx);
+			let a3 = Math.atan2(endY - cy, endX - cx);
+
+			// Gebruik het kruisproduct om de draairichting te bepalen
+			const cross = (x2 - startX) * (endY - y2) - (y2 - startY) * (endX - x2);
+			const isCW = cross < 0;
+
+			// Corrigeer de hoeken als we de nul-meridiaan van de cirkel (0 / 2PI) passeren
+			if (isCW && a1 < a3) a1 += 2 * Math.PI;
+			else if (!isCW && a1 > a3) a3 += 2 * Math.PI;
+
+			const points = [];
+			const step = (a3 - a1) / segments;
+			
+			points.push([startX, startY]);
+			for (let i = 1; i < segments; i++) {
+				points.push([
+					cx + Math.cos(a1 + i * step) * r,
+					cy + Math.sin(a1 + i * step) * r
+				]);
+			}
+			points.push([endX, endY]);
+
+			arcCache.set(cacheKey, points);
+			if (isForward) return points;
+
+			const reversed = [];
+			for (let i = points.length - 1; i >= 0; i--) {
+				reversed.push(points[i]);
+			}
+			return reversed;
+		};
+
+		// Transformeert XML ring-elementen (inclusief segmenten en bogen) naar WGS84 coördinaten
+		const extractRingCoords = (ringNode: Element): any[] => {
+			const latLngs: any[] = [];
+			
+			const addPoint = (x: number, y: number) => {
+				const latLng = rdToWgs84(x, y);
+				if (latLngs.length === 0 || 
+					latLngs[latLngs.length - 1][0] !== latLng[0] || 
+					latLngs[latLngs.length - 1][1] !== latLng[1]) {
+					latLngs.push(latLng);
+				}
+			};
+
+			// Zoek doelgericht naar het segments element zonder de hele boom plat te slaan
+			const segmentsNode = ringNode.querySelector('segments, *|segments');
+
+			if (segmentsNode) {
+				const children = segmentsNode.children;
+				for (let i = 0; i < children.length; i++) {
+					const segment = children[i];
+					const posNode = segment.querySelector('posList, pos, *|posList, *|pos');
+					if (!posNode) continue;
+
+					const coords = posNode.textContent!.trim().split(/\s+/).map(Number);
+					const pts: number[][] = [];
+					
+					for (let j = 0; j < coords.length; j += 2) {
+						if (!isNaN(coords[j]) && !isNaN(coords[j + 1])) {
+							pts.push([coords[j], coords[j + 1]]);
+						}
+					}
+					
+					if (segment.localName === 'Arc' && pts.length >= 3) {
+						const arcPts = getArcPoints(pts[0][0], pts[0][1], pts[1][0], pts[1][1], pts[2][0], pts[2][1], 12);
+						for (let k = 0; k < arcPts.length; k++) {
+							addPoint(arcPts[k][0], arcPts[k][1]);
+						}
+					} else {
+						for (let k = 0; k < pts.length; k++) {
+							addPoint(pts[k][0], pts[k][1]);
+						}
+					}
+				}
+			} else {
+				// Fallback voor traditionele of eenvoudigere GML polygonen zonder segmenten
+				const posElements = ringNode.querySelectorAll('posList, pos, *|posList, *|pos');
+				for (let i = 0; i < posElements.length; i++) {
+					const coords = posElements[i].textContent!.trim().split(/\s+/).map(Number);
+					for (let j = 0; j < coords.length; j += 2) {
+						if (!isNaN(coords[j]) && !isNaN(coords[j + 1])) {
+							addPoint(coords[j], coords[j + 1]);
+						}
+					}
+				}
+			}
+
+			return latLngs;
+		};
+
+		// Verwerking van complexe vlakken met eventuele binnenringen (gaten)
+		const polygonContainers = node.querySelectorAll('Polygon, PolygonPatch, *|Polygon, *|PolygonPatch');
+
+		if (polygonContainers.length > 0) {
+			for (let i = 0; i < polygonContainers.length; i++) {
+				const polyContainer = polygonContainers[i];
+				const polygonRings: any[][] = [];
+				const children = polyContainer.children;
+				
+				let exteriorNode: Element | null = null;
+				const interiorNodes: Element[] = [];
+
+				for (let j = 0; j < children.length; j++) {
+					const child = children[j];
+					if (child.localName === 'exterior') exteriorNode = child;
+					else if (child.localName === 'interior') interiorNodes.push(child);
+				}
+
+				if (exteriorNode) {
+					const extCoords = extractRingCoords(exteriorNode);
+					if (extCoords.length > 2) {
+						polygonRings.push(extCoords);
+
+						for (let j = 0; j < interiorNodes.length; j++) {
+							const intCoords = extractRingCoords(interiorNodes[j]);
+							if (intCoords.length > 2) {
+								polygonRings.push(intCoords);
+							}
+						}
+					}
+				}
+
+				if (polygonRings.length > 0) {
+					const layer = L.polygon(polygonRings, styling);
 					layer.on('click', () => highlightMap(uniqueKey));
 					createdLayers.push(layer);
 				}
-			});
+			}
+			
+			return createdLayers;
+		}
+
+		// Controleert of een los coördinatenelement al is afgevangen binnen een complex vlak
+		const isInsidePolygon = (el: Element) => {
+			let curr = el.parentElement;
+			while (curr) {
+				const name = curr.localName || '';
+				if (name === 'Polygon' || name === 'Surface' || name === 'PolygonPatch') return true;
+				curr = curr.parentElement;
+			}
+			return false;
+		};
+
+		// Fallback voor overige simpele geometrieën (Punten, Lijnen) die geen complex vlak zijn
+		const posElements = node.querySelectorAll('posList, pos, *|posList, *|pos');
+		
+		for (let i = 0; i < posElements.length; i++) {
+			const posNode = posElements[i];
+			if (isInsidePolygon(posNode)) continue;
+
+			const coords = posNode.textContent!.trim().split(/\s+/).map(Number);
+			const latLngs: any[] = [];
+			for (let j = 0; j < coords.length; j += 2) {
+				if (!isNaN(coords[j]) && !isNaN(coords[j + 1])) {
+					latLngs.push(rdToWgs84(coords[j], coords[j + 1]));
+				}
+			}
+
+			let layer: any = null;
+			if (latLngs.length === 1) {
+				layer = L.circleMarker(latLngs[0], {
+					radius: 6,
+					...styling,
+					fillOpacity: styleKey === 'was_contour' ? 0 : 0.8
+				});
+			} else if (latLngs.length > 1) {
+				const isClosed =
+					Math.abs(latLngs[0][0] - latLngs[latLngs.length - 1][0]) < 0.0001 &&
+					Math.abs(latLngs[0][1] - latLngs[latLngs.length - 1][1]) < 0.0001;
+				layer = isClosed && latLngs.length > 3
+					? L.polygon(latLngs, styling)
+					: L.polyline(latLngs, styling);
+			}
+
+			if (layer) {
+				layer.on('click', () => highlightMap(uniqueKey));
+				createdLayers.push(layer);
+			}
+		}
+
 		return createdLayers;
 	}
 
@@ -514,6 +701,7 @@
 		mutations = [];
 		activeId = null;
 		leafletCache.clear();
+		arcCache.clear();
 		seenSignatures.clear();
 		if (wasLayer) wasLayer.clearLayers();
 		if (wordtLayer) wordtLayer.clearLayers();
